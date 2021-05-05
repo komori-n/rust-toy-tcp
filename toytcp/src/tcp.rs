@@ -96,6 +96,26 @@ impl TCP {
       .context("no connected socket")
   }
 
+  pub fn send(&self, sock_id: SockID, buffer: &[u8]) -> Result<()> {
+    let mut cursor = 0;
+    while cursor < buffer.len() {
+      let mut table = self.sockets.write().unwrap();
+      let mut socket = table
+        .get_mut(&sock_id)
+        .context(format!("no such socket: {:?}", sock_id))?;
+      let send_size = cmp::min(MSS, buffer.len() - cursor);
+      socket.send_tcp_packet(
+        socket.send_param.next,
+        socket.recv_param.next,
+        tcpflags::ACK,
+        &buffer[cursor..cursor + send_size],
+      )?;
+      cursor += send_size;
+      socket.send_param.next += send_size as u32;
+    }
+    Ok(())
+  }
+
   fn receive_handler(&self) -> Result<()> {
     dbg!("begin recv thread");
     let (_, mut receiver) = transport::transport_channel(
