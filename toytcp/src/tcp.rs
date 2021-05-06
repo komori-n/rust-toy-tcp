@@ -141,6 +141,30 @@ impl TCP {
     Ok(())
   }
 
+  pub fn recv(&self, sock_id: SockID, buffer: &mut [u8]) -> Result<usize> {
+    let mut table = self.sockets.write().unwrap();
+    let mut socket = table
+      .get_mut(&sock_id)
+      .context(format!("no such socket: {:?}", sock_id))?;
+    let mut received_size = socket.recv_buffer.len() - socket.recv_param.window as usize;
+    while received_size == 0 {
+      drop(table);
+      // データが来るまで待つ
+      dbg!("waiting incoming data");
+      self.wait_event(sock_id, TCPEventKind::DataArrived);
+      table = self.sockets.write().unwrap();
+      socket = table
+        .get_mut(&sock_id)
+        .context(format!("no such socket: {:?}", sock_id))?;
+      received_size = socket.recv_buffer.len() - socket.recv_param.window as usize;
+    }
+    let copy_size = cmp::min(buffer.len(), received_size);
+    buffer[..copy_size].copy_from_slice(&socket.recv_buffer[..copy_size]);
+    socket.recv_buffer.copy_within(copy_size.., 0);
+    socket.recv_param.window += copy_size as u16;
+    Ok(copy_size)
+  }
+
   fn timer(&self) {
     dbg!("begin timer thread");
     loop {
@@ -306,6 +330,7 @@ impl TCP {
     {
       socket.recv_param.next = packet.get_seq();
       socket.send_param.unacked_seq = packet.get_ack();
+      socket.status = TcpStatus::Established;
       dbg!("status: synrcvd ->", &socket.status);
       if let Some(id) = socket.listening_socket {
         let ls = table.get_mut(&id).unwrap();
@@ -366,6 +391,37 @@ impl TCP {
     }
   }
 
+  fn process_payload(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
+    // (buffer index)                           .-offset                     buffer.len()
+    //                       data        |<----+------- window---------------->|
+    // buffer  [+++++++++++++++++++++++++++++++**************                  ]
+    //                                   |     |   payload  |
+    // (sequence index)                next   seq
+    let offset = socket.recv_buffer.len() - socket.recv_param.window as usize
+      + (packet.get_seq() - socket.recv_param.next) as usize;
+    let copy_size = cmp::min(packet.payload().len(), socket.recv_buffer.len() - offset);
+
+    socket.recv_buffer[offset..offset + copy_size].copy_from_slice(&packet.payload()[..copy_size]);
+    socket.recv_param.tail = cmp::max(socket.recv_param.tail, packet.get_seq() + copy_size as u32);
+
+    if packet.get_seq() == socket.recv_param.next {
+      socket.recv_param.next = socket.recv_param.tail;
+      socket.recv_param.window -= (socket.recv_param.tail - packet.get_seq()) as u16;
+    }
+    if copy_size > 0 {
+      socket.send_tcp_packet(
+        socket.send_param.next,
+        socket.recv_param.next,
+        tcpflags::ACK,
+        &[],
+      )?;
+    } else {
+      dbg!("recv buffer overflow");
+    }
+    self.publish_event(socket.get_sock_id(), TCPEventKind::DataArrived);
+    Ok(())
+  }
+
   fn established_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
     dbg!("established handler");
     if socket.send_param.unacked_seq < packet.get_ack()
@@ -379,6 +435,10 @@ impl TCP {
     }
     if packet.get_flag() & tcpflags::ACK == 0 {
       return Ok(());
+    }
+    if !packet.payload().is_empty() {
+      dbg!("hoge");
+      self.process_payload(socket, &packet)?;
     }
     Ok(())
   }
