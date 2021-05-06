@@ -111,7 +111,7 @@ impl Socket {
   }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum TcpStatus {
   Listen,
   SynSent,

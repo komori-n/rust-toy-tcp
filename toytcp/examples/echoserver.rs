@@ -24,6 +24,8 @@ fn echo_server(local_addr: Ipv4Addr, local_port: u16) -> Result<()> {
       loop {
         let nbytes = cloned_tcp.recv(connected_socket, &mut buffer).unwrap();
         if nbytes == 0 {
+          dbg!("closing connection...");
+          cloned_tcp.close(connected_socket).unwrap();
           return;
         }
         print!("> {}", str::from_utf8(&buffer[..nbytes]).unwrap());
