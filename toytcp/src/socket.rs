@@ -29,7 +29,13 @@ pub struct Socket {
 }
 
 impl Socket {
-  pub fn new(local_addr: Ipv4Addr, remote_addr: Ipv4Addr, local_port: u16, remote_port: u16, status: TcpStatus) -> Result<Self> {
+  pub fn new(
+    local_addr: Ipv4Addr,
+    remote_addr: Ipv4Addr,
+    local_port: u16,
+    remote_port: u16,
+    status: TcpStatus,
+  ) -> Result<Self> {
     let (sender, _) = transport::transport_channel(
       65535,
       TransportChannelType::Layer4(TransportProtocol::Ipv4(IpNextHeaderProtocols::Tcp)),
@@ -85,9 +91,10 @@ impl Socket {
     dbg!("sent", &tcp_packet);
     if payload.is_empty() && tcp_packet.get_flag() == tcpflags::ACK {
       // 空のACKの場合は再送が必要ない
-      return Ok(sent_size)
+      return Ok(sent_size);
     }
-    self.retransmission_queue
+    self
+      .retransmission_queue
       .push_back(Retransmission::new(tcp_packet));
     Ok(sent_size)
   }
@@ -103,7 +110,7 @@ impl Socket {
 }
 
 #[derive(Debug)]
-pub enum TcpStatus{
+pub enum TcpStatus {
   Listen,
   SynSent,
   SynRcvd,

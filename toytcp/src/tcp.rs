@@ -28,7 +28,7 @@ impl TCP {
     let sockets = RwLock::new(HashMap::new());
     let tcp = Arc::new(Self {
       sockets,
-      event_condvar: (Mutex::new(None), Condvar::new())
+      event_condvar: (Mutex::new(None), Condvar::new()),
     });
     let cloned_tcp = tcp.clone();
     std::thread::spawn(move || {
@@ -107,7 +107,24 @@ impl TCP {
       let mut socket = table
         .get_mut(&sock_id)
         .context(format!("no such socket: {:?}", sock_id))?;
-      let send_size = cmp::min(MSS, buffer.len() - cursor);
+
+      // 相手からのACK応答が遅い場合は送信を少し遅らせる
+      while socket.send_param.window == 0 {
+        dbg!("unable to slide send window");
+
+        // 相手から受信応答が帰ってくるまで待つ
+        drop(table);
+        self.wait_event(sock_id, TCPEventKind::Acked);
+        table = self.sockets.write().unwrap();
+        socket = table
+          .get_mut(&sock_id)
+          .context(format!("no such socket: {:?}", sock_id))?;
+      }
+      let send_size = cmp::min(
+        MSS,
+        cmp::min(socket.send_param.window as usize, buffer.len() - cursor),
+      );
+      dbg!("current window size", socket.send_param.window);
       socket.send_tcp_packet(
         socket.send_param.next,
         socket.recv_param.next,
@@ -116,6 +133,10 @@ impl TCP {
       )?;
       cursor += send_size;
       socket.send_param.next += send_size as u32;
+      socket.send_param.window -= send_size as u16;
+
+      drop(table);
+      thread::sleep(Duration::from_millis(1));
     }
     Ok(())
   }
@@ -124,16 +145,18 @@ impl TCP {
     dbg!("begin timer thread");
     loop {
       let mut table = self.sockets.write().unwrap();
-      for (_, socket) in table.iter_mut() {
+      for (sock_id, socket) in table.iter_mut() {
         while let Some(mut item) = socket.retransmission_queue.pop_front() {
           if socket.send_param.unacked_seq > item.packet.get_seq() {
-            // ACK されているので何もする必要がない
-            // 次回の delete\acked_... でキューから削除される
             dbg!("successfully acked", item.packet.get_seq());
-            continue
+            socket.send_param.window += item.packet.payload().len() as u16;
+            self.publish_event(*sock_id, TCPEventKind::Acked);
+            continue;
           }
 
-          if item.latest_transmission_time.elapsed().unwrap() < Duration::from_secs(RETRANSMITTION_TIMEOUT) {
+          if item.latest_transmission_time.elapsed().unwrap()
+            < Duration::from_secs(RETRANSMITTION_TIMEOUT)
+          {
             // 挿入した時刻の昇順でキューに積まれるため、先頭要素がタイムアウトしていないなら
             // 他の要素もタイムアウトしていない
             socket.retransmission_queue.push_front(item);
@@ -169,7 +192,8 @@ impl TCP {
     let (_, mut receiver) = transport::transport_channel(
       65535,
       TransportChannelType::Layer3(IpNextHeaderProtocols::Tcp),
-    ).unwrap();
+    )
+    .unwrap();
     let mut packet_iter = transport::ipv4_packet_iter(&mut receiver);
     loop {
       let (packet, remote_addr) = match packet_iter.next() {
@@ -205,7 +229,7 @@ impl TCP {
         )) {
           Some(socket) => socket,
           None => continue,
-        }
+        },
       };
 
       if !packet.is_correct_checksum(local_addr, remote_addr) {
@@ -277,8 +301,9 @@ impl TCP {
     let socket = table.get_mut(&sock_id).unwrap();
 
     if packet.get_flag() & tcpflags::ACK != 0
-        && socket.send_param.unacked_seq <= packet.get_ack()
-        && packet.get_ack() <= socket.send_param.next {
+      && socket.send_param.unacked_seq <= packet.get_ack()
+      && packet.get_ack() <= socket.send_param.next
+    {
       socket.recv_param.next = packet.get_seq();
       socket.send_param.unacked_seq = packet.get_ack();
       dbg!("status: synrcvd ->", &socket.status);
@@ -294,9 +319,10 @@ impl TCP {
   fn synsent_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
     dbg!("syssent handler");
     if packet.get_flag() & tcpflags::ACK != 0
-        && socket.send_param.unacked_seq <= packet.get_ack()
-        && packet.get_ack() <= socket.send_param.next
-        && packet.get_flag() & tcpflags::SYN != 0 {
+      && socket.send_param.unacked_seq <= packet.get_ack()
+      && packet.get_ack() <= socket.send_param.next
+      && packet.get_flag() & tcpflags::SYN != 0
+    {
       socket.recv_param.next = packet.get_seq() + 1;
       socket.recv_param.initial_seq = packet.get_seq();
       socket.send_param.unacked_seq = packet.get_ack();
@@ -322,7 +348,7 @@ impl TCP {
         dbg!("status: synsent ->", &socket.status);
       }
     }
-      Ok(())
+    Ok(())
   }
 
   /// 現在の ACK の進捗（unacked_seq の値）を元に再送キューから要素を消していく
@@ -331,6 +357,7 @@ impl TCP {
     while let Some(item) = socket.retransmission_queue.pop_front() {
       if socket.send_param.unacked_seq > item.packet.get_seq() {
         dbg!("successfully acked", item.packet.get_seq());
+        socket.send_param.window += item.packet.payload().len() as u16;
         self.publish_event(socket.get_sock_id(), TCPEventKind::Acked);
       } else {
         socket.retransmission_queue.push_front(item);
@@ -342,7 +369,8 @@ impl TCP {
   fn established_handler(&self, socket: &mut Socket, packet: &TCPPacket) -> Result<()> {
     dbg!("established handler");
     if socket.send_param.unacked_seq < packet.get_ack()
-        && packet.get_ack() <= socket.send_param.next {
+      && packet.get_ack() <= socket.send_param.next
+    {
       socket.send_param.unacked_seq = packet.get_ack();
       // ACK の進捗が進んだので再送キューから必要なくなった要素を消す
       self.delete_acked_segment_from_retransmission_queue(socket);
